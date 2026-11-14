@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% block title %}导出时间窗{% endblock %}
+{% block content %}
+<p><a href="/">← 返回总览</a></p>
+<h2>导出单船时间窗（可重演复盘包）</h2>
+<p class="muted">选择船舶与 UTC 时间窗（<strong>含起点、不含终点</strong>），下载 ZIP。包内
+<code>track.csv</code> 可直接经“上传原档”入口导入空库重演；<code>manifest.csv</code>
+给出窗口内每条记录的判定、所属原批次与原档行号，并标注其在 <code>track.csv</code> 中的行号。
+包内还会带上窗口前最后一个可信点（若存在）作为速度门限基准，以及窗口内所需的原始行；
+同秒冲突、重投与先到次序不会被裁剪改变。</p>
+
+{% if vessels %}
+{% set selected = request.query_params.get('mmsi') %}
+<form class="upload" method="post" action="/exports/window">
+  <label>船舶
+    <select name="mmsi" required>
+      {% for v in vessels %}
+      <option value="{{ v['mmsi'] }}" {% if v['mmsi'] == selected %}selected{% endif %}>{{ v["mmsi"] }}（v{{ v["version"] }}）</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label>起点（含）
+    <input type="text" name="start" required placeholder="1767225600 或 2026-01-01T00:00:00Z">
+  </label>
+  <label>终点（不含）
+    <input type="text" name="end" required placeholder="1767225780 或 2026-01-01T00:03:00Z">
+  </label>
+  <button type="submit">生成并下载 ZIP</button>
+</form>
+<p class="muted">时间可用 UTC 秒或 ISO-8601（<code>Z</code> 或显式偏移）；无偏移的时间按 UTC 解释。</p>
+{% else %}
+<p class="muted">还没有已发布船舶，无法导出。</p>
+{% endif %}
+{% endblock %}

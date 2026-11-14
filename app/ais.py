@@ -130,6 +130,20 @@ def _parse_float(text: str) -> float:
     return value
 
 
+def _is_identity_text(value: str) -> bool:
+    """Can this station name be exported and re-imported byte for byte?
+
+    The window export writes station names into a CSV that the reviewer
+    re-uploads.  ``csv.reader.line_num`` is a *physical* line counter, so a
+    station containing a newline would make the exported manifest line
+    numbers ambiguous, and the same value would occupy different physical
+    line counts before and after trimming.  Such names are therefore refused
+    at the upload boundary instead of producing an unexportable record.
+    """
+
+    return "\r" not in value and "\n" not in value
+
+
 def parse_ais_csv(payload: bytes) -> ParseOutcome:
     """Parse the uploaded archive, keeping per-row rejection reasons."""
 
@@ -153,94 +167,109 @@ def parse_ais_csv(payload: bytes) -> ParseOutcome:
     mapping = _map_header(header)
     outcome = ParseOutcome()
 
-    for row in reader:
-        line_no = reader.line_num
-        if not row or all(not cell.strip() for cell in row):
-            continue
-        try:
-            station = row[mapping["station"]].strip()
-            mmsi = row[mapping["mmsi"]].strip()
-            utc_text = row[mapping["utc"]]
-            lat_text = row[mapping["lat"]]
-            lon_text = row[mapping["lon"]]
-        except IndexError:
-            outcome.rejected.append(
-                {"line": line_no, "reason": "malformed_row", "detail": "字段数量少于表头"}
-            )
-            continue
-
-        if not station:
-            outcome.rejected.append(
-                {"line": line_no, "reason": "missing_station", "detail": "岸站号为空"}
-            )
-            continue
-        if len(station) > 64:
-            outcome.rejected.append(
-                {"line": line_no, "reason": "invalid_station", "detail": "岸站号超过 64 字符"}
-            )
-            continue
-
-        if not mmsi.isdigit() or not (MMSI_MIN <= int(mmsi) <= MMSI_MAX):
-            outcome.rejected.append(
-                {"line": line_no, "reason": "invalid_mmsi", "detail": f"MMSI 非法: {mmsi!r}"}
-            )
-            continue
-
-        try:
-            utc = _parse_int(utc_text)
-        except (TypeError, ValueError):
-            outcome.rejected.append(
-                {"line": line_no, "reason": "invalid_utc", "detail": f"UTC 秒非法: {utc_text!r}"}
-            )
-            continue
-        if not (EARLIEST_UTC <= utc <= LATEST_UTC):
-            outcome.rejected.append(
-                {
-                    "line": line_no,
-                    "reason": "utc_out_of_range",
-                    "detail": f"UTC 秒超出 2000-2100 年范围: {utc}",
-                }
-            )
-            continue
-
-        try:
-            lat = _parse_float(lat_text)
-            lon = _parse_float(lon_text)
-        except (TypeError, ValueError):
-            outcome.rejected.append(
-                {
-                    "line": line_no,
-                    "reason": "invalid_position",
-                    "detail": f"经纬度非法: lat={lat_text!r} lon={lon_text!r}",
-                }
-            )
-            continue
-        if not (LAT_MIN <= lat <= LAT_MAX and LON_MIN <= lon <= LON_MAX):
-            outcome.rejected.append(
-                {
-                    "line": line_no,
-                    "reason": "position_out_of_range",
-                    "detail": f"经纬度越界: lat={lat} lon={lon}",
-                }
-            )
-            continue
-        if lat == 0.0 and lon == 0.0:
-            outcome.rejected.append(
-                {"line": line_no, "reason": "position_null_island", "detail": "0,0 常为无效定位"}
-            )
-            continue
-
-        outcome.rows.append(
-            RawRow(
-                line_no=line_no,
-                station=station,
-                mmsi=mmsi.lstrip("0") or "0",
-                utc=utc,
-                lat=round(lat, POSITION_DECIMALS),
-                lon=round(lon, POSITION_DECIMALS),
-            )
-        )
+    try:
+        for row in reader:
+            _parse_row(row, reader.line_num, mapping, outcome)
+    except csv.Error as exc:
+        raise CsvFormatError(f"CSV 结构无法解析: {exc}") from exc
     return outcome
+
+
+def _parse_row(row: list[str], line_no: int, mapping: dict[str, int], outcome: ParseOutcome) -> None:
+    if not row or all(not cell.strip() for cell in row):
+        return
+    try:
+        station = row[mapping["station"]].strip()
+        mmsi = row[mapping["mmsi"]].strip()
+        utc_text = row[mapping["utc"]]
+        lat_text = row[mapping["lat"]]
+        lon_text = row[mapping["lon"]]
+    except IndexError:
+        outcome.rejected.append(
+            {"line": line_no, "reason": "malformed_row", "detail": "字段数量少于表头"}
+        )
+        return
+
+    if not station:
+        outcome.rejected.append(
+            {"line": line_no, "reason": "missing_station", "detail": "岸站号为空"}
+        )
+        return
+    if len(station) > 64:
+        outcome.rejected.append(
+            {"line": line_no, "reason": "invalid_station", "detail": "岸站号超过 64 字符"}
+        )
+        return
+    if not _is_identity_text(station):
+        outcome.rejected.append(
+            {
+                "line": line_no,
+                "reason": "invalid_station",
+                "detail": "岸站号含换行，无法可靠导出与重演",
+            }
+        )
+        return
+
+    if not mmsi.isdigit() or not (MMSI_MIN <= int(mmsi) <= MMSI_MAX):
+        outcome.rejected.append(
+            {"line": line_no, "reason": "invalid_mmsi", "detail": f"MMSI 非法: {mmsi!r}"}
+        )
+        return
+
+    try:
+        utc = _parse_int(utc_text)
+    except (TypeError, ValueError):
+        outcome.rejected.append(
+            {"line": line_no, "reason": "invalid_utc", "detail": f"UTC 秒非法: {utc_text!r}"}
+        )
+        return
+    if not (EARLIEST_UTC <= utc <= LATEST_UTC):
+        outcome.rejected.append(
+            {
+                "line": line_no,
+                "reason": "utc_out_of_range",
+                "detail": f"UTC 秒超出 2000-2100 年范围: {utc}",
+            }
+        )
+        return
+
+    try:
+        lat = _parse_float(lat_text)
+        lon = _parse_float(lon_text)
+    except (TypeError, ValueError):
+        outcome.rejected.append(
+            {
+                "line": line_no,
+                "reason": "invalid_position",
+                "detail": f"经纬度非法: lat={lat_text!r} lon={lon_text!r}",
+            }
+        )
+        return
+    if not (LAT_MIN <= lat <= LAT_MAX and LON_MIN <= lon <= LON_MAX):
+        outcome.rejected.append(
+            {
+                "line": line_no,
+                "reason": "position_out_of_range",
+                "detail": f"经纬度越界: lat={lat} lon={lon}",
+            }
+        )
+        return
+    if lat == 0.0 and lon == 0.0:
+        outcome.rejected.append(
+            {"line": line_no, "reason": "position_null_island", "detail": "0,0 常为无效定位"}
+        )
+        return
+
+    outcome.rows.append(
+        RawRow(
+            line_no=line_no,
+            station=station,
+            mmsi=mmsi.lstrip("0") or "0",
+            utc=utc,
+            lat=round(lat, POSITION_DECIMALS),
+            lon=round(lon, POSITION_DECIMALS),
+        )
+    )
 
 
 # --------------------------------------------------------------------------
@@ -308,6 +337,7 @@ def evaluate_track(rows: Iterable[Candidate]) -> Evaluation:
 
     statuses: dict[int, tuple[str, str | None, str | None]] = {}
     second_reports: list[dict] = []
+    reports_by_utc: dict[int, dict] = {}
     positions_by_second: dict[int, list[Candidate]] = {}
 
     for utc in sorted(by_second):
@@ -316,19 +346,19 @@ def evaluate_track(rows: Iterable[Candidate]) -> Evaluation:
         if len(distinct) > 1:
             for c in group:
                 statuses[c.row_id] = ("isolated", "conflict", None)
-            second_reports.append(
-                {
-                    "utc": utc,
-                    "status": "conflict",
-                    "candidate_count": len(group),
-                    "distinct_positions": len(distinct),
-                    "max_drift_nm": max(
-                        haversine_nm(group[0].lat, group[0].lon, c.lat, c.lon) for c in group
-                    )
-                    if len(group) > 1
-                    else 0.0,
-                }
-            )
+            report = {
+                "utc": utc,
+                "status": "conflict",
+                "candidate_count": len(group),
+                "distinct_positions": len(distinct),
+                "max_drift_nm": max(
+                    haversine_nm(group[0].lat, group[0].lon, c.lat, c.lon) for c in group
+                )
+                if len(group) > 1
+                else 0.0,
+            }
+            second_reports.append(report)
+            reports_by_utc[utc] = report
         else:
             # Identical duplicates collapse: the earliest-arriving row wins so
             # that re-sent telegrams do not create pseudo-tracks.  The winner
@@ -338,21 +368,24 @@ def evaluate_track(rows: Iterable[Candidate]) -> Evaluation:
             for c in group:
                 if c is winner:
                     continue
+                # The message deliberately avoids row ids: an exported window is
+                # replayed in a fresh database where ids are reassigned, and the
+                # verdict (including its explanation) must stay comparable.
                 statuses[c.row_id] = (
                     "isolated",
                     "duplicate",
-                    f"与候选 #{winner.row_id} 同秒同位置，仅保留该候选",
+                    f"与岸站 {winner.station} 的同秒同位置重投重复，仅保留先到候选",
                 )
             positions_by_second[utc] = [winner]
-            second_reports.append(
-                {
-                    "utc": utc,
-                    "status": "duplicate" if len(group) > 1 else "ok",
-                    "candidate_count": len(group),
-                    "distinct_positions": 1,
-                    "max_drift_nm": 0.0,
-                }
-            )
+            report = {
+                "utc": utc,
+                "status": "duplicate" if len(group) > 1 else "ok",
+                "candidate_count": len(group),
+                "distinct_positions": 1,
+                "max_drift_nm": 0.0,
+            }
+            second_reports.append(report)
+            reports_by_utc[utc] = report
 
     # Now walk the surviving, unique-per-second candidates in time order and
     # isolate those that imply an impossible speed from the previous trusted
@@ -361,6 +394,7 @@ def evaluate_track(rows: Iterable[Candidate]) -> Evaluation:
     trusted: list[TrustedPoint] = []
     prev: TrustedPoint | None = None
     for utc, (candidate,) in ordered:
+        report = reports_by_utc[utc]
         if prev is None:
             candidate.status, candidate.reason, candidate.detail = "trusted", None, None
             point = TrustedPoint(
@@ -386,10 +420,8 @@ def evaluate_track(rows: Iterable[Candidate]) -> Evaluation:
                 f"相对上一可信点 {prev.utc} 的速度 {knots:.1f} 节超过 {MAX_SPEED_KNOTS:.0f} 节"
                 f"（间隔 {dt} 秒，距离 {distance:.2f} 海里）"
             )
-            for report in second_reports:
-                if report["utc"] == utc:
-                    report["status"] = "speed_exceeded"
-                    report["speed_knots"] = round(knots, 2)
+            report["status"] = "speed_exceeded"
+            report["speed_knots"] = round(knots, 2)
             continue
 
         candidate.status, candidate.reason, candidate.detail = "trusted", None, None
@@ -404,9 +436,7 @@ def evaluate_track(rows: Iterable[Candidate]) -> Evaluation:
         )
         trusted.append(point)
         prev = point
-        for report in second_reports:
-            if report["utc"] == utc:
-                report["speed_knots"] = round(knots, 2)
+        report["speed_knots"] = round(knots, 2)
 
     for candidate in rows:
         status = statuses.get(candidate.row_id)

@@ -57,7 +57,8 @@
       <td>{{ v["last_utc"]|utc }}</td>
       <td>
         <a href="/vessels/{{ v['mmsi'] }}/track.csv">可信航迹</a> ·
-        <a href="/vessels/{{ v['mmsi'] }}/isolated.csv">隔离清单</a>
+        <a href="/vessels/{{ v['mmsi'] }}/isolated.csv">隔离清单</a> ·
+        <a href="/export?mmsi={{ v['mmsi'] }}">导出时间窗</a>
       </td>
     </tr>
   {% endfor %}

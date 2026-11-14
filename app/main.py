@@ -7,12 +7,13 @@ import sqlite3
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Request, UploadFile, File
+from fastapi import FastAPI, Form, HTTPException, Request, UploadFile, File
 from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 
 from .ais import MAX_SPEED_KNOTS
 from .db import connect, init_db, read_tx
+from .export import ExportError, build_window_package, parse_utc_bound
 from .store import Store, UploadError
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -373,6 +374,92 @@ def _render_isolated_csv(mmsi: str, rows) -> bytes:
             ]
         )
     return buf.getvalue().encode("utf-8")
+
+
+@app.get("/export", response_class=HTMLResponse)
+def export_page(request: Request):
+    conn = _conn()
+    try:
+        with read_tx(conn):
+            vessels = conn.execute("SELECT mmsi, version FROM vessels ORDER BY mmsi").fetchall()
+    finally:
+        conn.close()
+    return _render(request, "export.html", vessels=vessels)
+
+
+@app.get("/exports/window")
+def export_window_get(
+    request: Request,
+    mmsi: str = "",
+    start: str = "",
+    end: str = "",
+):
+    return _export_window_response(request, mmsi, start, end)
+
+
+@app.post("/exports/window")
+def export_window_post(
+    request: Request,
+    mmsi: str = Form(...),
+    start: str = Form(...),
+    end: str = Form(...),
+):
+    return _export_window_response(request, mmsi, start, end)
+
+
+def _export_window_response(request: Request, mmsi: str, start: str, end: str):
+    # The upload parser stores MMSIs without leading zeros; accept the same
+    # spelling a reviewer may copy from a telegram.
+    mmsi = (mmsi or "").strip().lstrip("0") or "0"
+    if not (start or "").strip() or not (end or "").strip():
+        return _render(
+            request,
+            "error.html",
+            title="时间窗无效",
+            message="缺少起点或终点时间；时间窗含起点、不含终点。",
+            status_code=400,
+        )
+    try:
+        start_utc = parse_utc_bound(start)
+        end_utc = parse_utc_bound(end)
+    except ValueError as exc:
+        return _render(
+            request,
+            "error.html",
+            title="时间窗无效",
+            message=str(exc),
+            status_code=400,
+        )
+
+    conn = _conn()
+    try:
+        # One read snapshot: the vessel version, its baseline and all window
+        # verdicts are pinned together even if an upload commits concurrently.
+        with read_tx(conn):
+            package = build_window_package(
+                conn, mmsi, start_utc, end_utc, max_track_bytes=MAX_UPLOAD_BYTES
+            )
+    except ExportError as exc:
+        return _render(
+            request,
+            "error.html",
+            title="时间窗导出未生成",
+            message=exc.message,
+            status_code=exc.status,
+        )
+    finally:
+        conn.close()
+
+    return StreamingResponse(
+        io.BytesIO(package.data),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": _attachment(package.filename),
+            "Content-Length": str(len(package.data)),
+            "X-Track-Version": str(package.version),
+            "X-Export-Format": "ais-window-export-v1",
+        },
+    )
 
 
 @app.get("/healthz", response_class=PlainTextResponse)

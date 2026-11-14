@@ -10,7 +10,8 @@
 </p>
 <p>
   <a href="/vessels/{{ vessel['mmsi'] }}/track.csv">下载可信航迹 CSV</a> ·
-  <a href="/vessels/{{ vessel['mmsi'] }}/isolated.csv">下载隔离清单 CSV</a>
+  <a href="/vessels/{{ vessel['mmsi'] }}/isolated.csv">下载隔离清单 CSV</a> ·
+  <a href="/export?mmsi={{ vessel['mmsi'] }}">导出时间窗复盘包</a>
 </p>
 <p class="muted">涉及原档批次（可分别下载原档）：
   {% for b in batches %}<a href="/batches/{{ b['id'] }}">{{ b["filename"] }}</a>{% if not loop.last %} · {% endif %}{% endfor %}
